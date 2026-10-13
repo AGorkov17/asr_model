@@ -1,0 +1,144 @@
+experiment_name: tiny_tcresnet_v1
+init_weights: null
+
+model:
+  _target_: src.model.TinyTCResNet
+  in_features: 64
+  n_classes: ${len:${train_dataloader.dataset.idx_to_keyword}}
+  channels: 32
+  stem_groups: 16
+  dilations: [1, 2, 4, 8, 16]
+  hidden_size: 16
+  dropout: 0.1
+
+loss:
+  _target_: torch.nn.CrossEntropyLoss
+  label_smoothing: 0.05
+
+train_dataloader:
+  _target_: torch.utils.data.DataLoader
+  num_workers: 4
+  batch_size: 256
+  prefetch_factor: 2
+  persistent_workers: true
+  pin_memory: true
+  collate_fn: ${function:src.data.collator}
+  shuffle: true
+  dataset:
+    _target_: src.data.SpotterDataset
+    manifest_path: ???
+    sample_rate: 16000
+    num_samples: 16000
+    idx_to_keyword:
+      - sber
+      - joy
+      - afina
+      - salut
+      - filler
+    waveform_transform:
+      _target_: src.data.WaveformAugment
+      sample_rate: 16000
+      max_shift_ms: 100.0
+      max_gain_db: 6.0
+      noise_probability: 0.5
+      min_snr_db: 10.0
+      max_snr_db: 30.0
+    transforms:
+      - _target_: torchaudio.transforms.MelSpectrogram
+        sample_rate: 16000
+        n_fft: 400
+        win_length: 400
+        hop_length: 160
+        n_mels: ${model.in_features}
+      - _target_: src.data.SpecScaler
+      - _target_: torchaudio.transforms.FrequencyMasking
+        freq_mask_param: 6
+      - _target_: torchaudio.transforms.TimeMasking
+        time_mask_param: 10
+
+val_dataloader:
+  _target_: torch.utils.data.DataLoader
+  num_workers: ${train_dataloader.num_workers}
+  batch_size: ${train_dataloader.batch_size}
+  prefetch_factor: ${train_dataloader.prefetch_factor}
+  persistent_workers: ${train_dataloader.persistent_workers}
+  pin_memory: ${train_dataloader.pin_memory}
+  collate_fn: ${train_dataloader.collate_fn}
+  shuffle: false
+  dataset:
+    _target_: src.data.SpotterDataset
+    manifest_path: ???
+    sample_rate: ${train_dataloader.dataset.sample_rate}
+    num_samples: ${train_dataloader.dataset.num_samples}
+    idx_to_keyword: ${train_dataloader.dataset.idx_to_keyword}
+    transforms:
+      - ${getindex:${train_dataloader.dataset.transforms}, 0}
+      - ${getindex:${train_dataloader.dataset.transforms}, 1}
+
+predict_dataloader:
+  _target_: torch.utils.data.DataLoader
+  num_workers: 2
+  batch_size: ${val_dataloader.batch_size}
+  prefetch_factor: ${val_dataloader.prefetch_factor}
+  persistent_workers: true
+  pin_memory: ${val_dataloader.pin_memory}
+  collate_fn: ${val_dataloader.collate_fn}
+  shuffle: false
+  dataset:
+    _target_: ${val_dataloader.dataset._target_}
+    manifest_path: ???
+    sample_rate: ${val_dataloader.dataset.sample_rate}
+    num_samples: ${val_dataloader.dataset.num_samples}
+    idx_to_keyword: ${val_dataloader.dataset.idx_to_keyword}
+    transforms: ${val_dataloader.dataset.transforms}
+    test: true
+
+trainer:
+  _target_: pytorch_lightning.Trainer
+  accelerator: auto
+  devices: 1
+  precision: 32
+  max_epochs: 30
+  max_steps: -1
+  val_check_interval: 1.0
+  check_val_every_n_epoch: 1
+  log_every_n_steps: 25
+  accumulate_grad_batches: 1
+  gradient_clip_val: 1.0
+
+logger:
+  _target_: pytorch_lightning.loggers.TensorBoardLogger
+  save_dir: ./artifacts/logs
+  name: ${experiment_name}
+
+csv_logger:
+  _target_: pytorch_lightning.loggers.CSVLogger
+  save_dir: ./artifacts/logs
+  name: ${experiment_name}_csv
+
+checkpoint:
+  _target_: pytorch_lightning.callbacks.ModelCheckpoint
+  dirpath: ./artifacts/${experiment_name}/checkpoints
+  filename: best-{epoch:02d}-{step}
+  monitor: val/accuracy
+  mode: max
+  save_top_k: 1
+  save_last: true
+  auto_insert_metric_name: false
+
+early_stopping:
+  _target_: pytorch_lightning.callbacks.EarlyStopping
+  monitor: val/accuracy
+  mode: max
+  patience: 6
+  min_delta: 0.0005
+
+optim:
+  _target_: torch.optim.AdamW
+  lr: 0.003
+  weight_decay: 0.0001
+
+scheduler:
+  _target_: torch.optim.lr_scheduler.CosineAnnealingLR
+  T_max: ${trainer.max_epochs}
+  eta_min: 0.00001

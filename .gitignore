@@ -1,0 +1,7 @@
+artifacts/
+lightning_logs/
+outputs/
+submit.csv
+__pycache__/
+*.py[cod]
+

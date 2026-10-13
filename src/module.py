@@ -10,7 +10,7 @@ from torchmetrics import Accuracy
 class KWS(pl.LightningModule):
     def __init__(self, conf):
         super().__init__()
-        self.save_hyperparameters()
+        self.save_hyperparameters({"model": conf.model._target_})
 
         self.conf = conf
 
@@ -21,13 +21,23 @@ class KWS(pl.LightningModule):
         self.valid_acc = Accuracy(
             task="multiclass", num_classes=conf.model.n_classes, top_k=1
         )
+        self.valid_class_acc = Accuracy(
+            task="multiclass",
+            num_classes=conf.model.n_classes,
+            top_k=1,
+            average=None,
+        )
 
-        self.loss = torch.nn.NLLLoss()
+        self.loss = (
+            hydra.utils.instantiate(conf.loss)
+            if conf.get("loss") is not None
+            else torch.nn.NLLLoss()
+        )
 
     def forward(self, inputs: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        logprobs = self.model(inputs)
-        preds = logprobs.argmax(1)
-        return logprobs, preds
+        scores = self.model(inputs)
+        preds = scores.argmax(1)
+        return scores, preds
 
     def on_train_start(self):
 
@@ -43,40 +53,70 @@ class KWS(pl.LightningModule):
             self.model,
             inputs=(sample_inputs,),
         )
-        self.log("MACs", macs)
-        self.log("Params", params)
+        print(f"Model parameters: {int(params):,}")
+        print(f"Model MACs: {int(macs):,}")
+        self.log("model/MACs", macs)
+        self.log("model/Params", params)
 
     def training_step(
         self, batch: Tuple[torch.Tensor, torch.Tensor, torch.Tensor], batch_idx: int
     ):
         _, inputs, labels = batch
 
-        logprobs, preds = self.forward(inputs)
+        scores, preds = self.forward(inputs)
 
-        loss = self.loss(logprobs, labels)
+        loss = self.loss(scores, labels)
+        self.train_acc.update(preds, labels)
 
-        log = {
-            "train/loss": loss,
-            "lr": self.optimizers().param_groups[0]["lr"],
-            "train/accuracy": self.train_acc(preds, labels),
-        }
-
-        self.log_dict(log, on_step=True)
+        self.log(
+            "train/loss",
+            loss,
+            on_step=True,
+            on_epoch=True,
+            prog_bar=True,
+            batch_size=labels.shape[0],
+        )
+        self.log(
+            "train/accuracy",
+            self.train_acc,
+            on_step=False,
+            on_epoch=True,
+            prog_bar=True,
+        )
+        self.log(
+            "lr",
+            self.optimizers().param_groups[0]["lr"],
+            on_step=True,
+            on_epoch=False,
+        )
 
         return {"loss": loss}
-
-    def on_train_epoch_end(self):
-        self.train_acc.reset()
 
     def validation_step(
         self, batch: Tuple[torch.Tensor, torch.Tensor, torch.Tensor], batch_idx: int
     ):
         _, inputs, labels = batch
 
-        logprobs, preds = self.forward(inputs)
+        scores, preds = self.forward(inputs)
 
-        loss = self.loss(logprobs, labels)
+        loss = self.loss(scores, labels)
         self.valid_acc.update(preds, labels)
+        self.valid_class_acc.update(preds, labels)
+        self.log(
+            "val/loss",
+            loss,
+            on_step=False,
+            on_epoch=True,
+            prog_bar=True,
+            batch_size=labels.shape[0],
+        )
+        self.log(
+            "val/accuracy",
+            self.valid_acc,
+            on_step=False,
+            on_epoch=True,
+            prog_bar=True,
+        )
 
         return {"loss": loss}
 
@@ -90,8 +130,12 @@ class KWS(pl.LightningModule):
         return ids, preds
 
     def on_validation_epoch_end(self):
-        self.log("val/accuracy", self.valid_acc.compute())
-        self.valid_acc.reset()
+        class_accuracy = self.valid_class_acc.compute()
+        for index, keyword in enumerate(
+            self.conf.val_dataloader.dataset.idx_to_keyword
+        ):
+            self.log(f"val/recall_{keyword}", class_accuracy[index])
+        self.valid_class_acc.reset()
 
     def train_dataloader(self):
         return hydra.utils.instantiate(self.conf.train_dataloader)
@@ -107,4 +151,17 @@ class KWS(pl.LightningModule):
             self.conf.optim,
             params=self.model.parameters(),
         )
-        return {"optimizer": optimizer}
+        if self.conf.get("scheduler") is None:
+            return {"optimizer": optimizer}
+
+        scheduler = hydra.utils.instantiate(
+            self.conf.scheduler,
+            optimizer=optimizer,
+        )
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {
+                "scheduler": scheduler,
+                "interval": "epoch",
+            },
+        }
